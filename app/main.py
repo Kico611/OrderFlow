@@ -249,32 +249,71 @@ def delete_category(category_id: int, db: Session = Depends(get_db)):
     redis_client.delete(f"category:{category_id}")
     return {"message": "Category deleted"}
 
-#Rute za narudzbe
+# Rute za narudžbe
+
 @app.get("/orders_with_items/")
 def get_all_orders_with_items(db: Session = Depends(get_db)):
-    # Dohvaćanje svih narudžbi zajedno s pripadajućim stavkama koristeći relationship
+    # Fetch all orders with their items
     orders = db.query(Order).options(joinedload(Order.order_items)).all()
-    
-    # Formatiranje podataka u razumljiv JSON format
+
     result = [
         {
-            "order_id": order.id,           # ID narudžbe
-            "user_id": order.user_id,       # ID korisnika
-            "total_price": order.total_price,  # Ukupna cijena narudžbe
+            "order_id": order.id,
+            "user_id": order.user_id,
+            "total_price": order.total_price,
             "order_items": [
                 {
-                    "product_id": item.product_id,  # ID proizvoda
-                    "quantity": item.quantity,      # Količina proizvoda
-                    "price": item.price             # Cijena proizvoda
+                    "product_id": item.product_id,
+                    "quantity": item.quantity,
+                    "price": item.price  # Total price for this item
                 }
-                for item in order.order_items  # Iterira kroz stavke narudžbe
+                for item in order.order_items
             ]
         }
-        for order in orders  # Iterira kroz sve narudžbe
+        for order in orders
     ]
-    
-    # Vraća formatirane podatke kao JSON odgovor
+
     return {"orders": result}
+
+
+@app.post("/orders_with_items/")
+def create_order_with_items(order_request: CreateOrderRequest, db: Session = Depends(get_db)):
+    if not order_request.items:
+        raise HTTPException(status_code=400, detail="Order must have at least one item")
+
+    total_price = 0
+
+    new_order = Order(user_id=order_request.user_id, total_price=0)
+    db.add(new_order)
+    db.commit()
+    db.refresh(new_order)
+
+    for item in order_request.items:
+        product = db.query(Product).filter(Product.id == item.product_id).first()
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product with ID {item.product_id} not found")
+
+        item_price = product.price * item.quantity
+        total_price += item_price
+
+        order_item = OrderItem(
+            order_id=new_order.id,
+            product_id=item.product_id,
+            quantity=item.quantity,
+            price=item_price
+        )
+        db.add(order_item)
+
+    new_order.total_price = total_price
+    db.commit()
+
+    return {
+        "order": {
+            "order_id": new_order.id,
+            "user_id": new_order.user_id,
+            "total_price": new_order.total_price
+        }
+    }
 
 @app.put("/orders_with_items/{order_id}")
 def update_order_with_items(order_id: int, items: List[ItemOrder], db: Session = Depends(get_db)):
@@ -345,23 +384,22 @@ def update_order_with_items(order_id: int, items: List[ItemOrder], db: Session =
         },
         "order_items": order_items_response
     }
-    
+
+
 @app.get("/orders_with_items/{order_id}")
 def read_order_with_items(order_id: int, db: Session = Depends(get_db)):
-    # Dohvatiti narudžbu prema order_id
+    # Fetch the order
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Dohvati stavke narudžbe
     order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
-    
-    # Priprema odgovora s detaljima narudžbe i stavki
+
     order_items_response = [
         {
             "product_id": item.product_id,
             "quantity": item.quantity,
-            "price": item.price
+            "price": item.price  # Total price for this item
         }
         for item in order_items
     ]
@@ -377,15 +415,12 @@ def read_order_with_items(order_id: int, db: Session = Depends(get_db)):
 
 @app.delete("/orders_with_items/{order_id}")
 def delete_order_with_items(order_id: int, db: Session = Depends(get_db)):
-    # Dohvati narudžbu prema order_id
+    # Fetch the order by ID
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Brisanje stavki narudžbe
     db.query(OrderItem).filter(OrderItem.order_id == order_id).delete()
-
-    # Brisanje narudžbe
     db.delete(order)
     db.commit()
 
