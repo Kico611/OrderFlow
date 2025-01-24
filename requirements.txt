@@ -5,3 +5,8 @@ pymysql
 cryptography
 redis
 aioredis
+python-multipart
+passlib
+typing
+pydantic
+pydantic[email]

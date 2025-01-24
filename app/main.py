@@ -1,10 +1,12 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
+from fastapi import FastAPI, Depends, HTTPException,Form, Query
+from sqlalchemy.orm import Session,joinedload
 import redis
 import json
 from database import engine, Base, SessionLocal
-from models import Item
+from models import User, Product, Category, Order, OrderItem,ItemOrder,CreateOrderRequest
+from passlib.context import CryptContext
+from typing import Optional,List
 
 # Kreiranje baze podataka (ako već ne postoji)
 Base.metadata.create_all(bind=engine)
@@ -31,6 +33,13 @@ def get_db():
     finally:
         db.close()
 
+# Inicijalizacija za hashiranje lozinki
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    """Funkcija za hashiranje lozinke."""
+    return pwd_context.hash(password)
+
 # Pomoćna funkcija za pretvaranje objekta u rječnik (bez metapodataka SQLAlchemy-a)
 def item_to_dict(item):
     item_dict = item.__dict__
@@ -38,106 +47,346 @@ def item_to_dict(item):
         del item_dict['_sa_instance_state']
     return item_dict
 
-@app.get("/")
-def read_root():
-    # Početna ruta
-    return {"message": "Pozdrav svijete"}
+# User Routes
+@app.get("/users/")
+def get_all_users(db: Session = Depends(get_db)):
+    users = db.query(User).all()
+    if not users:
+        return {"message": "No users found"}
+    return {"users": [item_to_dict(user) for user in users]}
 
-@app.post("/items/")
-def create_item(name: str, description: str, db: Session = Depends(get_db)):
-    # Kreiranje novog itema u bazi podataka
-    item = Item(name=name, description=description)
-    db.add(item)
+@app.post("/users/")
+def create_user(username: str, email: str, password: str, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.email == email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    hashed_password = hash_password(password)
+    user = User(username=username, email=email, password_hash=hashed_password)
+    
+    db.add(user)
     db.commit()
-    db.refresh(item)
+    db.refresh(user)
+    
+    redis_client.delete(f"user_{user.id}")  
+    return {"user": item_to_dict(user)}
 
-    # Brisanje predmemorije kako bi se osigurali svježi podaci
-    redis_client.delete("items_cache")
+@app.get("/users/{user_id}")
+def read_user(user_id: int, db: Session = Depends(get_db)):
+  
+    cached_user = redis_client.get(f"user_{user_id}")
+    if cached_user:
+        return {"user": json.loads(cached_user), "redis_debug": "Keširanje uspješno!"}
 
-    return {
-        "item": item_to_dict(item),
-        "redis_debug": "items_cache očišćen"
-    }
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
 
-@app.get("/items/")
-def read_items(db: Session = Depends(get_db)):
-    # Provjera postoji li predmemorirani popis u Redis-u
-    cached_items = redis_client.get("items_cache")
-    if cached_items:
-        return {
-            "items": json.loads(cached_items),
-            "redis_debug": "Keširanje uspješno!"
+    redis_client.set(f"user_{user_id}", json.dumps(item_to_dict(user)))
+    return {"user": item_to_dict(user)}
+
+@app.put("/users/{user_id}")
+def update_user(user_id: int, username: str = None, email: str = None, password: str = None, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.username = username if username is not None else user.username
+    user.email = email if email is not None else user.email
+
+    if password:
+        user.password_hash = hash_password(password)
+
+    db.commit()
+    db.refresh(user)
+
+    redis_client.delete(f"user_{user_id}")
+    redis_client.set(f"user_{user_id}", json.dumps(item_to_dict(user)))
+    return {"user": item_to_dict(user)}
+
+@app.delete("/users/{user_id}")
+def delete_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db.delete(user)
+    db.commit()
+    redis_client.delete(f"user_{user_id}") 
+    return {"message": "User deleted"}
+
+# Product Routes
+@app.get("/products/")
+def get_all_products(db: Session = Depends(get_db)):
+  
+    products = db.query(Product).all()
+    product_list = [item_to_dict(product) for product in products]
+
+    return {"products": product_list}
+
+@app.post("/products/")
+def create_product(name: str, description: str, price: int, category_id: int, db: Session = Depends(get_db)):
+    product = Product(name=name, description=description, price=price, category_id=category_id)
+
+    db.add(product)
+    db.commit()
+    db.refresh(product)
+
+    redis_client.delete(f"product_{product.id}")
+    return {"product": item_to_dict(product)}
+
+@app.get("/products/{product_id}")
+def read_product(product_id: int, db: Session = Depends(get_db)):
+  
+    cached_product = redis_client.get(f"product_{product_id}")
+    if cached_product:
+        return {"product": json.loads(cached_product), "redis_debug": "Keširanje uspješno!"}
+
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    redis_client.set(f"product_{product_id}", json.dumps(item_to_dict(product)))
+    return {"product": item_to_dict(product)}
+
+@app.put("/products/{product_id}")
+def update_product(product_id: int,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    price: Optional[float] = None,
+    category_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product.name = name if name is not None else product.name
+    product.description = description if description is not None else product.description
+    product.price = price if price is not None else product.price
+    product.category_id = category_id if category_id is not None else product.category_id
+
+    db.commit()
+    db.refresh(product)
+
+    redis_client.delete(f"product_{product_id}")
+    redis_client.set(f"product_{product_id}", json.dumps(item_to_dict(product)))
+    return {"product": item_to_dict(product)}
+
+@app.delete("/products/{product_id}")
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    db.delete(product)
+    db.commit()
+
+    redis_client.delete(f"product_{product_id}")
+    return {"message": "Product deleted"}
+
+# Rute za Kategorije
+@app.get("/categories/")
+def get_all_categories(db: Session = Depends(get_db)):
+    
+    categories = db.query(Category).all()
+    category_list = [item_to_dict(category) for category in categories]
+    return {"categories": category_list}
+
+@app.post("/categories/")
+def create_category(name: str, db: Session = Depends(get_db)):
+    category = Category(name=name)
+    
+    db.add(category)
+    db.commit()
+    db.refresh(category)
+
+    redis_client.set(f"category:{category.id}", json.dumps(item_to_dict(category)))
+    return {"category": item_to_dict(category)}
+
+@app.get("/categories/{category_id}")
+def read_category(category_id: int, db: Session = Depends(get_db)):
+  
+    cached_category = redis_client.get(f"category:{category_id}")
+    if cached_category:
+        return {"category": json.loads(cached_category), "redis_debug": "Keširanje uspješno!"}
+
+    category = db.query(Category).filter(Category.id == category_id).first()
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+
+    redis_client.set(f"category:{category.id}", json.dumps(item_to_dict(category)))
+    return {"category": item_to_dict(category)}
+
+@app.put("/categories/{category_id}")
+def update_category(category_id: int, name: str, db: Session = Depends(get_db)):
+   
+    category = db.query(Category).filter(Category.id == category_id).first()
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+
+    category.name = name
+    db.commit()
+    db.refresh(category)
+
+    redis_client.delete(f"category:{category_id}")
+    redis_client.set(f"category:{category.id}", json.dumps(item_to_dict(category)))
+
+    return {"category": item_to_dict(category)}
+
+@app.delete("/categories/{category_id}")
+def delete_category(category_id: int, db: Session = Depends(get_db)):
+  
+    category = db.query(Category).filter(Category.id == category_id).first()
+    if not category:
+        raise HTTPException(status_code=404, detail="Category not found")
+
+    db.delete(category)
+    db.commit()
+
+    redis_client.delete(f"category:{category_id}")
+    return {"message": "Category deleted"}
+
+#Rute za narudzbe
+@app.get("/orders_with_items/")
+def get_all_orders_with_items(db: Session = Depends(get_db)):
+    # Dohvaćanje svih narudžbi zajedno s pripadajućim stavkama koristeći relationship
+    orders = db.query(Order).options(joinedload(Order.order_items)).all()
+    
+    # Formatiranje podataka u razumljiv JSON format
+    result = [
+        {
+            "order_id": order.id,           # ID narudžbe
+            "user_id": order.user_id,       # ID korisnika
+            "total_price": order.total_price,  # Ukupna cijena narudžbe
+            "order_items": [
+                {
+                    "product_id": item.product_id,  # ID proizvoda
+                    "quantity": item.quantity,      # Količina proizvoda
+                    "price": item.price             # Cijena proizvoda
+                }
+                for item in order.order_items  # Iterira kroz stavke narudžbe
+            ]
         }
+        for order in orders  # Iterira kroz sve narudžbe
+    ]
+    
+    # Vraća formatirane podatke kao JSON odgovor
+    return {"orders": result}
 
-    # Ako predmemorija ne postoji, dohvaćanje svih itema iz baze podataka
-    items = db.query(Item).all()
-    item_list = [item_to_dict(item) for item in items]
+@app.put("/orders_with_items/{order_id}")
+def update_order_with_items(order_id: int, items: List[ItemOrder], db: Session = Depends(get_db)):
+    # Dohvati narudžbu prema order_id
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    # Spremanje popisa u Redis
-    redis_client.set("items_cache", json.dumps(item_list))
-    return {
-        "items": item_list,
-        "redis_debug": "items_cache ažuriran"
-    }
+    # Dohvati sve postojeće stavke narudžbe
+    existing_order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
 
-@app.get("/items/{item_id}")
-def read_item(item_id: int, db: Session = Depends(get_db)):
-    # Provjera postoji li pojedinačni item u predmemoriji
-    cached_item = redis_client.get(f"item_{item_id}")
-    if cached_item:
-        return {
-            "item": json.loads(cached_item),
-            "redis_debug": "Keširanje uspješno!"
+    total_price = 0
+    order_items = []
+
+    for item in items:
+        product = db.query(Product).filter(Product.id == item.product_id).first()
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product with ID {item.product_id} not found")
+
+        price = product.price  # Jedinična cijena proizvoda, uvijek definirana na početku petlje
+
+        # Provjeri postoji li već stavka za taj proizvod
+        existing_item = next((oi for oi in existing_order_items if oi.product_id == item.product_id), None)
+
+        if existing_item:
+            # Ako stavka već postoji, ažuriraj ju
+            existing_item.quantity = item.quantity
+            existing_item.price = price  # Postavi cijenu na cijenu jednog proizvoda
+            db.add(existing_item)  # Dodaj izmijenjenu stavku
+            db.commit()  # Potvrdi promjene u bazi
+            db.refresh(existing_item)  # Osvježi promijenjenu stavku kako bi dobio nove podatke
+            order_items.append(existing_item)  # Dodaj ažuriranu stavku u odgovor
+        else:
+            # Ako stavka ne postoji, kreiraj novu
+            order_item = OrderItem(
+                order_id=order.id,  # Poveži stavku s narudžbom
+                product_id=item.product_id,
+                quantity=item.quantity,
+                price=price
+            )
+            db.add(order_item)
+            db.commit()  # Spremi novu stavku
+            db.refresh(order_item)  # Osvježi novu stavku kako bi dobio novi ID
+            order_items.append(order_item)  # Dodaj novu stavku u odgovor
+
+        # Izračunavanje ukupne cijene narudžbe
+        total_price += price * item.quantity
+
+    # Ažuriraj ukupnu cijenu narudžbe
+    order.total_price = total_price
+    db.commit()  # Spremi promjenu ukupne cijene narudžbe
+
+    # Priprema odgovora s detaljima narudžbe i stavki
+    order_items_response = [
+        {
+            "product_id": item.product_id,
+            "quantity": item.quantity,
+            "price": item.price
         }
+        for item in order_items
+    ]
 
-    # Ako predmemorija ne postoji, dohvaćanje itema iz baze podataka
-    item = db.query(Item).filter(Item.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Item nije pronađen")
-
-    # Spremanje itema u Redis
-    item_dict = item_to_dict(item)
-    redis_client.set(f"item_{item_id}", json.dumps(item_dict))
     return {
-        "item": item_dict,
-        "redis_debug": "Ne postoji u redisu, item predmemoriran u redis"
+        "order": {
+            "order_id": order.id,  
+            "user_id": order.user_id,
+            "total_price": order.total_price
+        },
+        "order_items": order_items_response
+    }
+    
+@app.get("/orders_with_items/{order_id}")
+def read_order_with_items(order_id: int, db: Session = Depends(get_db)):
+    # Dohvatiti narudžbu prema order_id
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    # Dohvati stavke narudžbe
+    order_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
+    
+    # Priprema odgovora s detaljima narudžbe i stavki
+    order_items_response = [
+        {
+            "product_id": item.product_id,
+            "quantity": item.quantity,
+            "price": item.price
+        }
+        for item in order_items
+    ]
+
+    return {
+        "order": {
+            "order_id": order.id,
+            "user_id": order.user_id,
+            "total_price": order.total_price
+        },
+        "order_items": order_items_response
     }
 
-@app.put("/items/{item_id}")
-def update_item(item_id: int, name: str, description: str, db: Session = Depends(get_db)):
-    # Ažuriranje postojećeg itema u bazi podataka
-    item = db.query(Item).filter(Item.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Item nije pronađen")
+@app.delete("/orders_with_items/{order_id}")
+def delete_order_with_items(order_id: int, db: Session = Depends(get_db)):
+    # Dohvati narudžbu prema order_id
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
 
-    item.name = name
-    item.description = description
+    # Brisanje stavki narudžbe
+    db.query(OrderItem).filter(OrderItem.order_id == order_id).delete()
+
+    # Brisanje narudžbe
+    db.delete(order)
     db.commit()
-    db.refresh(item)
 
-    # Ažuriranje predmemorije za pojedinačni item i brisanje predmemorije popisa
-    item_dict = item_to_dict(item)
-    redis_client.set(f"item_{item_id}", json.dumps(item_dict))
-    redis_client.delete("items_cache")
-    return {
-        "item": item_dict,
-        "redis_debug": "Predmemorija itema ažurirana, items_cache očišćen"
-    }
-
-@app.delete("/items/{item_id}")
-def delete_item(item_id: int, db: Session = Depends(get_db)):
-    # Brisanje itema iz baze podataka
-    item = db.query(Item).filter(Item.id == item_id).first()
-    if not item:
-        raise HTTPException(status_code=404, detail="Item nije pronađen")
-
-    db.delete(item)
-    db.commit()
-
-    # Brisanje predmemorije za pojedinačni item i cijeli popis
-    redis_client.delete(f"item_{item_id}")
-    redis_client.delete("items_cache")
-    return {
-        "message": "Item obrisan",
-        "redis_debug": "Predmemorija itema obrisana, items_cache očišćen"
-    }
+    return {"message": "Order and associated order items deleted"}
